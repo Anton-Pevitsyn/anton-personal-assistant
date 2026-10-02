@@ -2,9 +2,32 @@ import json
 import os
 import sqlite3
 import time
+import subprocess
+import tempfile
+import uuid
 import urllib.request
 import urllib.error
 from pathlib import Path
+
+MAX_VOICE_BYTES = 10 * 1024 * 1024
+MAX_VOICE_SECONDS = 300
+
+
+def transcribe(key, audio):
+    boundary = uuid.uuid4().hex
+    parts = []
+    for name, value in [('model', os.environ.get('TRANSCRIBE_MODEL', 'gpt-4o-mini-transcribe')),
+                        ('language', 'ru'), ('response_format', 'json')]:
+        parts.append(('--' + boundary + '\r\nContent-Disposition: form-data; name="' +
+                      name + '"\r\n\r\n' + value + '\r\n').encode())
+    parts.append(('--' + boundary + '\r\nContent-Disposition: form-data; name="file"; '
+                  'filename="voice.wav"\r\nContent-Type: audio/wav\r\n\r\n').encode())
+    parts.extend([audio, ('\r\n--' + boundary + '--\r\n').encode()])
+    req = urllib.request.Request('https://api.openai.com/v1/audio/transcriptions',
+        b''.join(parts), {'Authorization': 'Bearer ' + key,
+                         'Content-Type': 'multipart/form-data; boundary=' + boundary})
+    with urllib.request.urlopen(req, timeout=150) as response:
+        return json.load(response).get('text', '').strip()
 
 PROMPT = '''Ты личный ассистент Антона, учредителя и директора ООО «ГенЛи».
 Компания производит и поставляет газопоршневые и дизельные электростанции.
@@ -47,6 +70,23 @@ class Bot:
         for start in range(0, len(text), 1800):
             self.telegram('sendMessage', {'chat_id': chat_id, 'text': text[start:start+1800]})
 
+    def voice_text(self, voice):
+        info = self.telegram('getFile', {'file_id': voice['file_id']})
+        if info.get('file_size', 0) > MAX_VOICE_BYTES:
+            raise ValueError('Voice too large')
+        url = self.base.replace('/bot', '/file/bot', 1) + info['file_path']
+        with urllib.request.urlopen(url, timeout=60) as response:
+            audio = response.read(MAX_VOICE_BYTES + 1)
+        if len(audio) > MAX_VOICE_BYTES:
+            raise ValueError('Voice too large')
+        with tempfile.TemporaryDirectory() as folder:
+            src, dst = Path(folder) / 'voice.ogg', Path(folder) / 'voice.wav'
+            src.write_bytes(audio)
+            subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-y', '-i', str(src),
+                '-t', str(MAX_VOICE_SECONDS), '-ac', '1', '-ar', '16000', str(dst)],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=45)
+            return transcribe(self.key, dst.read_bytes())
+
     def handle(self, update):
         msg = update.get('message', {})
         chat = msg.get('chat', {})
@@ -58,7 +98,8 @@ class Bot:
         if command in ('/start', '/help'):
             self.send(chat_id, 'Антон, я твой личный ассистент. Напиши вопрос или задачу.\n'
                 '/new — очистить историю\n/id — показать твой Telegram ID\n'
-                'Пока работаю с текстом. Интернет, документы и напоминания не подключены.')
+                'Отправляй текст или голосовое до 5 минут — отвечу текстом.\n'
+                'Интернет, документы и напоминания не подключены.')
             return
         if command == '/id':
             self.send(chat_id, str(self.owner))
@@ -68,8 +109,19 @@ class Bot:
             self.db.commit()
             self.send(chat_id, 'История в приложении очищена. Начинаем новый разговор.')
             return
+        voice = msg.get('voice')
+        if voice:
+            if voice.get('duration', 0) > MAX_VOICE_SECONDS or voice.get('file_size', 0) > MAX_VOICE_BYTES:
+                self.send(chat_id, 'Отправь голосовое не длиннее 5 минут и не больше 10 МБ.')
+                return
+            self.send(chat_id, 'Распознаю голосовое…')
+            text = self.voice_text(voice)
+            if not text:
+                self.send(chat_id, 'Не удалось разобрать речь. Отправь запись ещё раз или напиши текстом.')
+                return
+            self.send(chat_id, 'Распознано:\n' + text)
         if not text:
-            self.send(chat_id, 'Пока поддерживаю только текстовые сообщения.')
+            self.send(chat_id, 'Поддерживаю текст и голосовые сообщения. Пришли запись через микрофон Telegram.')
             return
         rows = self.db.execute('SELECT role, content FROM '
             '(SELECT * FROM history ORDER BY id DESC LIMIT 20) ORDER BY id').fetchall()
