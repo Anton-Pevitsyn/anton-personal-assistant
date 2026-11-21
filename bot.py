@@ -15,7 +15,7 @@ from calendar_bridge import GoogleCalendar, CalendarError
 from document_work import DocumentWork, DocumentError, MAX_BYTES
 
 TZ = ZoneInfo('Europe/Samara')
-VERSION = '2026-11-21-documents-v1'
+VERSION = '2026-11-21-documents-v2'
 
 DOCUMENT_TOOL = {
     'type': 'function', 'name': 'document_action', 'strict': True,
