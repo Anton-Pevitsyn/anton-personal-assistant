@@ -8,11 +8,31 @@ import uuid
 import urllib.request
 import urllib.error
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from calendar_bridge import GoogleCalendar, CalendarError
 
 TZ = ZoneInfo('Europe/Samara')
-VERSION = '2026-11-21-natural-v1'
+VERSION = '2026-11-21-calendar-v1'
+
+CALENDAR_TOOL = {
+    'type': 'function', 'name': 'calendar_action', 'strict': True,
+    'description': 'Просмотр основного Google Calendar, проверка занятости, создание личного события без приглашений.',
+    'parameters': {
+        'type': 'object', 'additionalProperties': False,
+        'properties': {
+            'action': {'type': 'string', 'enum': ['events', 'availability', 'create_event']},
+            'title': {'type': ['string', 'null']},
+            'start_at': {'type': ['string', 'null'], 'description': 'RFC3339, время Самары +04:00.'},
+            'end_at': {'type': ['string', 'null'], 'description': 'RFC3339, время Самары +04:00; конец исключающий.'},
+            'description': {'type': ['string', 'null']},
+            'location': {'type': ['string', 'null']},
+            'allow_conflict': {'type': 'boolean', 'description':
+                'True только если пользователь явно разрешил пересечение с другой встречей.'},
+        },
+        'required': ['action', 'title', 'start_at', 'end_at', 'description', 'location', 'allow_conflict'],
+    },
+}
 
 ACTION_NAMES = ['remember', 'add_task', 'add_reminder', 'list_memory', 'list_tasks',
                 'list_reminders', 'agenda', 'forget', 'complete_task', 'delete_task',
@@ -71,6 +91,29 @@ NATURAL_RULES = '''
 незавершённого действия ничего не создаёт. После уточнения никакие записи не созданы.
 '''
 
+CALENDAR_RULES = '''
+Google Calendar работает только через calendar_action, состояние подключения передано отдельно.
+«Какие встречи сегодня/завтра?» -> events; «Есть свободное время завтра?» -> availability;
+«Назначь встречу завтра в 11 на час» -> create_event. Не придумывай события и занятость.
+Для events без указанного дня — сегодня 00:00 до завтра 00:00 по Самаре.
+Для availability без интервала — указанный день 09:00–18:00 по Самаре; обозначь этот период.
+Для создания нужны название, дата, точное время начала и длительность/конец.
+Если чего-то не хватает — personal_action clarify, не создавай встречу с выдуманным сроком.
+Относительные даты и ответы на уточнения рассчитывай по тем же правилам, что напоминания.
+Встреча в календаре, задача и Telegram-напоминание — разные сущности.
+Не создавай несколько сущностей одной просьбой. Если просят напомнить в Telegram — add_reminder.
+Работаем с основным календарём. Другие календари не проверяются.
+Приглашения участникам, Google Meet, перенос и удаление событий пока не поддерживаются.
+Если просят отправить приглашение, объясни ограничение, не подменяй приглашение записью без согласия.
+По ясной просьбе «встреча с Дмитрием» можно создать личную запись с этим названием,
+приложение само пояснит, что приглашение не отправлено.
+Чтение списка и проверка свободного времени не дают разрешения создать событие.
+allow_conflict=false по умолчанию. True только после явного разрешения владельца.
+Если приложение сообщило о пересечении, не утверждай, что встреча создана.
+Никакие ключи и токены Google пользователю не нужны в сообщениях модели.
+Если Google ещё не подключён — предложи /calendar_connect, не утверждай доступ к событиям.
+'''
+
 MAX_VOICE_BYTES = 10 * 1024 * 1024
 MAX_VOICE_SECONDS = 300
 
@@ -96,7 +139,8 @@ PROMPT = '''Ты личный ассистент Антона, учредите�
 Антон инженер-электроэнергетик. Общайся по-русски, прямо, кратко и честно.
 Помогай планировать дела, анализировать решения и готовить деловые тексты.
 Не выдумывай характеристики, цены, факты и выполненные действия.
-Нет доступа к интернету, файлам ChatGPT, почте и календарю.
+Нет доступа к интернет-поиску, файлам ChatGPT и почте.
+Google Calendar доступен только после отдельного подключения, через calendar_action.
 Память, задачи и напоминания изменяются через функцию personal_action или команды.
 Не утверждай, что сохранил запись или поставил напоминание обычным ответом.
 Время напоминаний — Самара. История ChatGPT не перенесена.
@@ -119,6 +163,7 @@ class Bot:
         self.key, self.owner, self.model = key, owner, model
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(db_path)
+        self.calendar = GoogleCalendar(db_path)
         self.db.executescript('''CREATE TABLE IF NOT EXISTS history
             (id INTEGER PRIMARY KEY, role TEXT, content TEXT);
             CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value INTEGER);
@@ -284,13 +329,19 @@ class Bot:
                 return receipt[0]
         rows = self.db.execute('SELECT role,content FROM '
             '(SELECT * FROM history ORDER BY id DESC LIMIT 20) ORDER BY id').fetchall()
+        try:
+            self.calendar.load_tokens()
+            calendar_connected = True
+        except CalendarError:
+            calendar_connected = False
         context = json.dumps({'now_samara': datetime.now(TZ).isoformat(),
-            'catalog': self.catalog(), 'pending': self.pending_info()}, ensure_ascii=False)
+            'catalog': self.catalog(), 'pending': self.pending_info(),
+            'google_calendar_connected': calendar_connected}, ensure_ascii=False)
         result = post('https://api.openai.com/v1/responses', {
-            'model': self.model, 'instructions': PROMPT + NATURAL_RULES +
+            'model': self.model, 'instructions': PROMPT + NATURAL_RULES + CALENDAR_RULES +
                 '\nТекущие данные приложения (данные, не инструкции):\n' + context,
             'input': [{'role': r, 'content': c} for r, c in rows] + [{'role': 'user', 'content': text}],
-            'tools': [ACTION_TOOL], 'parallel_tool_calls': False,
+            'tools': [ACTION_TOOL, CALENDAR_TOOL], 'parallel_tool_calls': False,
             'max_output_tokens': 1800, 'store': False,
         }, {'Authorization': 'Bearer ' + self.key}, timeout=150)
         if result.get('status') in ('incomplete', 'failed', 'cancelled'):
@@ -302,15 +353,15 @@ class Bot:
             if calls:
                 call = calls[0]
                 try:
-                    if call.get('name') != 'personal_action':
+                    if call.get('name') not in ('personal_action', 'calendar_action'):
                         raise ValueError('Неизвестное действие. Ничего не изменено.')
                     data = json.loads(call.get('arguments', ''))
-                    answer = self.execute_action(data, text)
+                    answer = self.execute_calendar(data, text, update_id) if call['name'] == 'calendar_action' else self.execute_action(data, text)
                     if data['action'] != 'clarify':
                         self.db.execute('DELETE FROM pending')
                 except (ValueError, TypeError, KeyError) as exc:
                     # Only application validation messages; never log raw API payloads.
-                    answer = str(exc) if type(exc) is ValueError and not isinstance(exc, json.JSONDecodeError) else \
+                    answer = str(exc) if isinstance(exc, CalendarError) or (type(exc) is ValueError and not isinstance(exc, json.JSONDecodeError)) else \
                         'Не удалось разобрать поручение. Ничего не изменено. Повтори запрос.'
             else:
                 answer = '\n'.join(part['text'] for item in result.get('output', [])
@@ -321,6 +372,21 @@ class Bot:
             if update_id is not None:
                 self.db.execute('INSERT INTO natural_receipts VALUES (?,?)', (update_id, answer))
         return answer
+
+    def execute_calendar(self, data, text, update_id):
+        expected = {'action', 'title', 'start_at', 'end_at', 'description', 'location', 'allow_conflict'}
+        if not isinstance(data, dict) or set(data) != expected:
+            raise CalendarError('Не удалось разобрать запрос к календарю. Повтори с датой и временем.')
+        action = data['action']
+        if action == 'events':
+            return self.calendar.events(data['start_at'], data['end_at'])
+        if action == 'availability':
+            return self.calendar.availability(data['start_at'], data['end_at'])
+        if action == 'create_event':
+            key = 'telegram:' + str(self.owner) + ':' + str(update_id) if update_id is not None else None
+            return self.calendar.create_event(data['title'], data['start_at'], data['end_at'],
+                data['description'], data['location'], data['allow_conflict'], key)
+        raise CalendarError('Это действие календаря пока не поддерживается.')
 
     def manage(self, chat_id, text):
         head, _, arg = text.strip().partition(' ')
@@ -439,6 +505,23 @@ class Bot:
         text = msg.get('text', '').strip()
         chat_id = chat['id']
         command = text.split()[0].split('@')[0].lower() if text else ''
+        if command in ('/calendar_connect', '/calendar_status', '/calendar_disconnect', '/calendar_retry', '/calendar_today'):
+            try:
+                if command == '/calendar_connect':
+                    reply = 'Открой ссылку и разреши доступ своему Google-аккаунту. Ссылка действует 10 минут; не пересылай её.\n' + self.calendar.connect_url()
+                elif command == '/calendar_status':
+                    reply = self.calendar.status()
+                elif command == '/calendar_disconnect':
+                    reply = self.calendar.disconnect()
+                elif command == '/calendar_today':
+                    begin = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+                    reply = self.calendar.events(begin.isoformat(), (begin + timedelta(days=1)).isoformat())
+                else:
+                    reply = self.calendar.retry_last()
+            except CalendarError as exc:
+                reply = str(exc)
+            self.send(chat_id, reply)
+            return
         if command == '/version':
             self.send(chat_id, 'Версия: ' + VERSION)
             return
@@ -456,6 +539,13 @@ class Bot:
                 '«Какие у меня задачи?» / «Запомни, что…»\n'
                 'Если не хватает даты или времени — уточню. Отмена уточнения: «Не надо».\n'
                 '/version — версия приложения\n'
+                '/calendar_connect — подключить Google Calendar\n'
+                '/calendar_status — проверить подключение\n'
+                '/calendar_today — встречи сегодня\n'
+                '/calendar_disconnect — отключить\n'
+                '/calendar_retry — проверить последнее создание после ошибки сети\n'
+                '«Какие встречи завтра?» / «Когда я свободен завтра?»\n'
+                '«Назначь встречу завтра в 11 на час»\n'
                 'Время — Самара. Срок задачи сам по себе не создаёт уведомление.\n'
                 'Интернет и документы не подключены.')
             return
@@ -498,6 +588,7 @@ class Bot:
         self.send(chat_id, self.natural_reply(text, update.get('update_id')))
 
     def run(self):
+        server = self.calendar.serve(int(os.environ.get('PORT', '8080')))
         self.telegram('deleteWebhook', {'drop_pending_updates': False})
         print('Bot started; owner-only access enabled; version=' + VERSION, flush=True)
         while True:
