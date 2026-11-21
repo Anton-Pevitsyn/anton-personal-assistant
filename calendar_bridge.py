@@ -21,6 +21,70 @@ SCOPES = ['openid', 'email', 'https://www.googleapis.com/auth/calendar.events.ow
           'https://www.googleapis.com/auth/calendar.freebusy']
 
 
+def public_page(privacy=False):
+    title = 'Политика конфиденциальности' if privacy else 'Anton Personal Assistant'
+    content = '''<h1>Anton Personal Assistant</h1>
+<p>Личный Telegram-ассистент Антона: общение текстом и голосом, задачи,
+напоминания и работа с основным Google Calendar владельца.</p>
+<p>После отдельного согласия Google приложение показывает события и свободное время,
+а по поручению владельца создаёт события. Перед созданием проверяется занятость.
+Приглашения другим людям не отправляются.</p>
+<p>Ассистент доступен только разрешённому Telegram-аккаунту владельца.
+Эта публичная страница не предоставляет доступ к переписке или календарю.</p>
+<p>Подключение запускается владельцем командой <code>/calendar_connect</code>
+в личном диалоге с ботом. Доступ можно отключить через <code>/calendar_disconnect</code>.</p>
+<p><a href="/privacy">Политика конфиденциальности</a></p>'''
+    if privacy:
+        content = '''<h1>Политика конфиденциальности</h1>
+<p><strong>Anton Personal Assistant</strong> — личное приложение владельца, Антона.
+Дата редакции: 21 ноября 2026 года. Приложение не предназначено для регистрации других пользователей.</p>
+<h2>Какие данные используются</h2>
+<p>Telegram ID владельца, сообщения, расшифрованные голосовые записи, сохранённые
+факты, задачи и напоминания. После согласия Google: email для проверки аккаунта,
+токены авторизации, события основного календаря и интервалы занятости.</p>
+<h2>Для чего нужен Google Calendar</h2>
+<p>Данные используются для показа событий и свободного времени и создания личных событий
+по поручению владельца. Приложение обращается только к основному календарю primary.
+Оно не расшаривает календарь и не отправляет приглашения участникам.</p>
+<h2>Обработка и передача</h2>
+<p>Telegram доставляет сообщения. OpenAI обрабатывает текст для ответа и понимания
+поручения и голос для распознавания. Списки событий, показанные в ответ на свободный
+запрос, могут попасть в историю диалога и передаваться OpenAI как контекст следующих запросов.
+Токены Google и секреты приложения модели не передаются. Google API выполняет
+операции с календарём. Приложение размещено на Railway.</p>
+<p>Код приложения не использует данные для рекламы и не продаёт их. Публичные страницы
+не содержат аналитики, сторонних скриптов, форм сбора данных или отслеживающих cookie.</p>
+<h2>Хранение и защита</h2>
+<p>На сервере хранится контекст последних 20 сообщений диалога. Постоянная память,
+задачи, напоминания и служебные записи выполненных операций хранятся в базе на
+постоянном диске до удаления владельцем. Временные аудиофайлы удаляются после обработки.
+OAuth-токены Google зашифрованы; ключ шифрования хранится отдельно в настройках Railway.</p>
+<p>Доступ к функциям бота ограничен Telegram ID владельца. Код не выводит переписку,
+секреты и параметры обратного OAuth-запроса в свои журналы. Google, OpenAI, Telegram
+и Railway обрабатывают данные также в соответствии со своими условиями и настройками хранения.</p>
+<h2>Отключение и удаление</h2>
+<p><code>/new</code> очищает локальную историю диалога; <code>/forget номер</code>
+удаляет факт, <code>/deltask номер</code> — задачу, <code>/cancel номер</code> —
+напоминание. Эти команды не удаляют сообщения в Telegram или события в Google Calendar.</p>
+<p><code>/calendar_disconnect</code> удаляет доступ Google из бота и пытается отозвать
+разрешение у Google. Дополнительно доступ можно отозвать в
+<a href="https://myaccount.google.com/connections">настройках Google-аккаунта</a>.
+Полное удаление серверной базы, включая служебные записи операций, выполняется владельцем
+в Railway; при этом удаляются все локальные данные ассистента. Резервные копии,
+если они включены владельцем, удаляются отдельно. События Google удаляются в Google Calendar.</p>
+<h2>Контакт</h2>
+<p>Приложением управляет его единственный пользователь — владелец. Контакт для
+вопросов о данных — адрес владельца, указанный как User support email на экране
+согласия Google для этого приложения.</p>
+<p><a href="/">На главную страницу приложения</a></p>'''
+    return '<!doctype html><html lang="ru"><head><meta charset="utf-8">' + \
+        '<meta name="viewport" content="width=device-width, initial-scale=1">' + \
+        '<title>' + title + '</title><style>body{font:18px/1.6 system-ui,sans-serif;' + \
+        'max-width:820px;margin:40px auto;padding:0 20px;color:#17233b}' + \
+        'h1{font-size:30px}h2{font-size:23px}a{color:#174fc4}code{font-size:16px}</style></head>' + \
+        '<body>' + content + '</body></html>'
+
+
 class CalendarError(ValueError):
     pass
 
@@ -357,7 +421,11 @@ class GoogleCalendar:
             def do_GET(self):
                 self.connection.settimeout(45)
                 parsed = urllib.parse.urlsplit(self.path)
-                if parsed.path == '/health':
+                content_type = 'text/plain; charset=utf-8'
+                if parsed.path in ('/', '/privacy', '/privacy/'):
+                    code, text = 200, public_page(parsed.path != '/')
+                    content_type = 'text/html; charset=utf-8'
+                elif parsed.path == '/health':
                     code, text = 200, 'ok'
                 elif parsed.path == '/oauth/google/callback' and len(self.path) <= 16000:
                     try:
@@ -371,9 +439,9 @@ class GoogleCalendar:
                     code, text = 404, 'Not found'
                 payload = text.encode()
                 self.send_response(code)
-                for key, value in [('Content-Type', 'text/plain; charset=utf-8'), ('Cache-Control', 'no-store'),
+                for key, value in [('Content-Type', content_type), ('Cache-Control', 'no-store'),
                                    ('Referrer-Policy', 'no-referrer'), ('X-Content-Type-Options', 'nosniff'),
-                                   ('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'"),
+                                   ('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'"),
                                    ('Content-Length', str(len(payload)))]:
                     self.send_header(key, value)
                 self.end_headers()
